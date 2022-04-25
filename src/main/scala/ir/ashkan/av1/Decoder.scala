@@ -14,6 +14,7 @@ import fs2.{Stream, Pull}
 import java.lang.Character.Subset
 import scodec.Err
 import cats.FunctorFilter
+import scala.collection.mutable.ArrayBuilder
 
 case class Decoder[F[_], A](run: Stream[F, Byte] => Pull[F, Nothing, Decoder.Result[F, A]]) {
     def decode(bs: Stream[F, Byte])(using Concurrent[F]): F[Decoder.Result[F, A]] =
@@ -139,14 +140,10 @@ object Decoder {
 
     def prefix[F[_]](s: String): Decoder[F, Unit] = prefix(s.toList.map(_.toByte))
 
-    def isolate[F[_]: Concurrent](size: Long): Decoder[F, Stream[F, Byte]] =
-        Decoder { bs =>
-            for
-                q <- cats.effect.std.Queue.unbounded[F, Option[Byte]]
-                _ <- 
-                _ <- q.offer(Some(???))
-                _ <- q.offer(None)
-            yield ???
-            ???
-        }
+    def take[F[_]](size: Long): Decoder[F, Array[Byte]] = {
+        def go(in: ArrayBuilder[Byte], n: Long): Decoder[F, ArrayBuilder[Byte]] =
+            if n > 0 then uint8.map(in.addOne).flatMap(go(_, n - 1)) else in.pure
+
+        go(ArrayBuilder.make[Byte], size).map(_.result)
+    }
 }

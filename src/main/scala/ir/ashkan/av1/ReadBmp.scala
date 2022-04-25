@@ -100,34 +100,22 @@ object ReadBmp extends IOApp.Simple {
         } yield colors.flatMap(_.raw)
     end bmpToRaw
 
-    def toStreamAndResult[F[_]: Concurrent, O, R](pull: Pull[F, O, R]): F[(Stream[F, O], F[R])] =
-        Deferred[F, R].map { result =>
-            (pull.flatMap(r => Pull.eval(result.complete(r).void)).stream, result.get)
-        }
+    // def toStreamAndResult[F[_]: Concurrent, O, R](pull: Pull[F, O, R]): F[(Stream[F, O], F[R])] =
+    //     Deferred[F, R].map { result =>
+    //         (pull.flatMap(r => Pull.eval(result.complete(r).void)).stream, result.get)
+    //     }
 
     def readImageData[F[_]: Concurrent](
         width: Int,
         height: Int,
         format: ColorDepth
-    ): Decoder[F, Stream[F, Color]] = Decoder { bs =>
+    ): Decoder[F, Array[Byte]] = {
         val row = width * format.bytes
         val pad = if (row % 4 == 0) 0 else 4 - (row % 4)
         val p   = format.pixel[F]
         val p2  = p <* drop8(pad)
 
-        val pull: Pull[F, Color, Stream[F, Byte]] = (bs, 0).tailRecM { case (bs, x) =>
-            val endOfRow = x + 1 > width
-            (if endOfRow then p2 else p).run(bs).flatMap {
-                case Success(a, rest) =>
-                    // val (x2, y2) = if endOfRow then (0, y + 1) else (x + 1, y)
-                    Pull.output1(a).as(Left((rest, if endOfRow then 0 else x + 1)))
-
-                case Failure(e) =>
-                    Pull.raiseError(new Exception(s"Decoder failed with $e"))
-            }
-        }
-???
-        // pull
+        take( (row + pad) * height * format.bytes)
     }
 
     val in  = Files[IO].readAll(Path("24bit.bmp"))
