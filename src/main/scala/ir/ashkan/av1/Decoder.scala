@@ -15,6 +15,11 @@ import java.lang.Character.Subset
 import scodec.Err
 import cats.FunctorFilter
 import scala.collection.mutable.ArrayBuilder
+import scala.reflect.ClassTag
+import cats.kernel.Monoid
+import cats.kernel.Semigroup
+import cats.SemigroupK
+import scala.collection.mutable.Builder
 
 case class Decoder[F[_], A](run: Stream[F, Byte] => Pull[F, Nothing, Decoder.Result[F, A]]) {
     def decode(bs: Stream[F, Byte])(using Concurrent[F]): F[Decoder.Result[F, A]] =
@@ -76,11 +81,11 @@ object Decoder {
             )
 
         override def raiseError[A](e: Error): Decoder[F, A] = Decoder(_ => Pull.pure(Failure(e)))
+    }
 
-        // override def functor: Functor[Decoder[F, _]] = this
-
-        // override def mapFilter[A, B](fa: Decoder[F, A])(f: A => Option[B]): Decoder[F, B] =
-        //     fa.flatMap(a => fromOption(f(a), FilterDidNotPass(a)))
+    given [F[_], G[_]: SemigroupK]: SemigroupK[[A] =>> Decoder[F, G[A]]] with {
+        override def combineK[A](x: Decoder[F, G[A]], y: Decoder[F, G[A]]): Decoder[F, G[A]] =
+            (x map2 y)(_ <+> _)
     }
 
     extension [F[_], A](fa: Decoder[F, A]) {
@@ -91,21 +96,27 @@ object Decoder {
 
         def collectOr[B](f: PartialFunction[A, B])(err: A => Error): Decoder[F, B] =
             fa.flatMap(a => f.lift(a).fold(err(a).raiseError)(_.pure))
+
+        def repeat[To](in: Builder[A, To], n: Long): Decoder[F, Builder[A, To]] =
+            repeat(in, _.addOne(_), n)
+
+        def repeat[S](s: S, f: (S, A) => S, n: Long): Decoder[F, S] =
+            if n > 0 then fa.flatMap(a => repeat(f(s, a), f, n - 1)) else s.pure
     }
 
     def eval[F[_], A](fa: F[A]): Decoder[F, A] = Decoder(bs => Pull.eval(fa).map(Success(_, bs)))
+
     def function[F[_], A](f: Stream[F, Byte] => (A, Stream[F, Byte])) =
         Decoder[F, A] { bs =>
             val (a, rest) = f(bs)
             Pull.pure(Result.Success(a, rest))
         }
 
-    def println[F[_], A](a: A)(using c: Console[F])(using Show[A]): Decoder[F, Unit] = eval(
-      c.println(a)
-    )
-    def print[F[_], A](a: A)(using c: Console[F])(using Show[A]): Decoder[F, Unit] = eval(
-      c.print(a)
-    )
+    def println[F[_], A](a: A)(using c: Console[F])(using Show[A]): Decoder[F, Unit] =
+        eval(c.println(a))
+
+    def print[F[_], A](a: A)(using c: Console[F])(using Show[A]): Decoder[F, Unit] =
+        eval(c.print(a))
 
     def void[F[_]]: Decoder[F, Unit] = ().pure[Decoder[F, _]]
 
