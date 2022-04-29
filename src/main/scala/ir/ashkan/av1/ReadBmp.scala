@@ -24,7 +24,7 @@ object ReadBmp extends IOApp.Simple {
   import Decoder.Error.*
   import Decoder.Result.*
 
-  case class Color(r: Byte, g: Byte, b: Byte) {
+  case class RGB(r: Byte, g: Byte, b: Byte) {
     val raw = Raw(r, g, b)
   }
 
@@ -32,14 +32,14 @@ object ReadBmp extends IOApp.Simple {
     var bytes = Stream(y, cr, cb)
   }
 
-  given Show[Color] = Show.show(t => "%02X%02X%02X".format(t.r, t.g, t.b))
+  given Show[RGB] = Show.show(t => "%02X%02X%02X".format(t.r, t.g, t.b))
 
   enum ColorDepth(val bits: Short) {
     case `24` extends ColorDepth(24)
     case `32` extends ColorDepth(32)
 
-    def pixel[F[_]]: Decoder[F, Color] = this match {
-      case `24` => (uint8, uint8, uint8).mapN((b, g, r) => Color(r, g, b))
+    def pixel[F[_]]: Decoder[F, RGB] = this match {
+      case `24` => (uint8, uint8, uint8).mapN((b, g, r) => RGB(r, g, b))
       case `32` => `24`.pixel <* drop8(1)
     }
 
@@ -55,7 +55,7 @@ object ReadBmp extends IOApp.Simple {
   }
   given Show[ColorDepth] = Show.show(bpp => s"Color depth: ${bpp.bits} bits")
 
-  def bmpToRaw[F[_]: Console: Concurrent]: Decoder[F, ArraySeq[Raw]] =
+  def bmpToRaw[F[_]: Console: Concurrent]: Decoder[F, ArraySeq[RGB]] =
     val BitmapInfoHeader: Decoder[F, (Int, Int, ColorDepth)] =
       for
         width <- uint32.assert(_ >= 0, "width")
@@ -88,64 +88,74 @@ object ReadBmp extends IOApp.Simple {
         _ <- drop32(1) // Reserved
       yield (width, height, depth)
 
-    val header: Decoder[F, (Int, Int, ColorDepth)] =
-      uint32.flatMap {
-        case 124 => BitmapInfoHeader
-        case 40 => BitmapV5Header
-        case size => Unknown(s"Unsupported header size: $size").raiseError
-      }
+    val dib: Decoder[F, (Int, Int, ColorDepth)] =
+      for
+        size <- uint32
+        dib <- size match {
+          case 40 => BitmapInfoHeader
+          case 124 => BitmapV5Header
+          case other => Decoder.fail(Unknown(s"Unsupported header size: $other"))
+        }
+      yield dib
+
+    val header =
+      for
+        _ <- prefix[F]("BM")
+        _ <- drop32(1) // file size
+        _ <- drop16(2) // reserved 1, reserved 2
+        offset <- uint32 // file offset to pixel array
+      yield offset
 
     for {
-      _ <- prefix[F]("BM")
-      _ <- drop32(1) // file size
-      _ <- drop16(2) // reserved 1, reserved 2
-      _ <- drop32(1) // file offset to pixel array
-      (w, h, bpp) <- header
+      (offset, s1) <- header.withConsumed 
+      ((w, h, bpp), s2) <- dib.withConsumed
+      _ <- println(s"Header size: $s1, DIB size: $s2, Offset: $offset")
       _ <- println(s"${w}x${h} pixels, Color depth: $bpp")
-      raw <- readImageData(w, h, bpp)
-    } yield raw
+      _ <- drop8(offset - s1 - s2)
+      pixels <- readImageData(w, h, bpp)(ArraySeq.newBuilder[RGB])
+    } yield pixels
   end bmpToRaw
 
   def readImageData[F[_]: Concurrent](
       width: Int,
       height: Int,
       format: ColorDepth
-  ): Decoder[F, ArraySeq[Raw]] = {
-    val row = width * format.bytes
-    val pad = if (row % 4 == 0) 0 else 4 - (row % 4)
-    val read = format.pixel[F].map(_.raw)
+  ): [C[_]] => Builder[RGB, C[RGB]] => Decoder[F, C[RGB]] =
+    [C[_]] =>
+      (acc: Builder[RGB, C[RGB]]) => {
+        val n = width * format.bytes
+        val pad = if (n % 4 == 0) 0 else 4 - (n % 4)
+        val pixel = format.pixel[F]
 
-    def readRow(acc: Builder[Raw, ArraySeq[Raw]]) =
-      (acc, 0)
-        .iterateWhileM { (acc, x) => read.map(acc.addOne(_) -> (x + 1)) }(_._2 < width)
-        .map(_._1) <* drop8(pad)
+        def row(acc: Builder[RGB, C[RGB]]) =
+          (acc, 0)
+            .iterateWhileM { (acc, x) => pixel.map(acc.addOne(_) -> (x + 1)) }(_._2 < width)
+            .map(_._1) <* drop8(pad)
 
-    val pixels =
-      val row = readRow(ArraySeq.newBuilder[Raw])
-      if height == 1 then row
-      else
-        row
-          .flatMap { acc =>
-            (acc, 0).iterateWhileM((ps, y) => readRow(ps).map((_, y + 1)))(_._2 < height - 1)
-          }
-          .map(_._1)
-    end pixels
+        val pixels =
+          val r0 = row(acc)
+          if height == 1 then r0
+          else
+            r0.flatMap { acc =>
+              (acc, 0).iterateWhileM((ps, y) => row(ps).map((_, y + 1)))(_._2 < height - 1)
+            }.map(_._1)
+        end pixels
 
-    pixels.map(_.result)
-  }
+        pixels.map(_.result)
+    }
 
   val in = Files[IO].readAll(Path("24bit.bmp"))
   val out = Files[IO].writeAll(Path("raw.ycrcb"))
   val run =
     for _ <- bmpToRaw[IO].decode(in).flatMap {
-        case Decoder.Result.Success(raws, _) =>
+        case Decoder.Result.Success(raws, _, c) =>
           Stream
             .fromIterator[IO](raws.iterator, 10)
-            .flatMap(_.bytes)
+            .flatMap(_.raw.bytes)
             .through(out)
             .compile
-            .drain >> Console[IO].println("Done")
+            .drain >> Console[IO].println(s"Read $c bytes. Done")
 
-        case Decoder.Result.Failure(e) => Console[IO].println(e)
+        case Decoder.Result.Failure(e, c) => Console[IO].println(s"Read $c bytes. $e")
       } yield ()
 }
