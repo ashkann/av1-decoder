@@ -85,14 +85,37 @@ object Avf1 extends IOApp.Simple {
   def ignore[F[_]: Console](header: BoxHeader): Decoder[F, Unit] = drop8(header.size - 12)
 
   def metaData[F[_]: Console](size: Int): Decoder[F, Unit] = {
-    def itemLocation[F[_]: Console]: Decoder[F, Unit] =
+    def itemLocation[F[_]: Console](version: Int): Decoder[F, Unit] =
       for
-        (offsetSize, lengthSize) <- uint8.map(b => (b & 0xF0, b & 0x0F))
+        (offsetSize, lengthSize) <- uint4x2
+        (baseOffsetSize, snd) <- uint4x2
+        indexSize = Option.when(version == 1 || version == 2)(snd)
+        itemCount <- if version < 2 then uint16.map(_.toInt) else uint32
+        _ <- (
+          for
+            itemId <- if version < 2 then uint16.map(_.toInt) else uint32
+            _ <- uint16.when(version == 1 || version == 2)
+            dataReferenceIndex <- uint16
+            _ = IntSize.fromSize(baseOffsetSize)
+            baseOffset <- baseOffsetSize match {
+              case 0 => Decoder.pure[F](0L)
+              case 4 => uint32.map(_.toLong)
+              case 8 => uint64
+              case s => Decoder.fail(s"Unsupported base_offset_size: $s")
+            }
+            extentCount <- uint16
+            // _ <- (
+            //   for
+            //     _ <- ()
+            //   yield ???  
+            // )
+          yield ()
+        ).replicateA(itemCount)
         _ <- println((offsetSize, lengthSize))
       yield ()
 
     val items = Map[String, BoxHeader => Decoder[F, Unit]](
-      "iloc" -> (h => itemLocation[F].consumeTo(h.size - 12)),
+      "iloc" -> (h => itemLocation[F](h.version).consumeTo(h.size - 12)),
       "pitm" -> ignore[F],
       "idat" -> ignore[F],
       "iprp" -> ignore[F],

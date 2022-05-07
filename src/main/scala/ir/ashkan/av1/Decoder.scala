@@ -115,6 +115,9 @@ object Decoder {
       withConsumed
         .assert(_._2 == expected, (_, c) => s"Consumed $c bytes instead of $expected bytes")
         .map(_._1)
+
+    def when(f: Boolean): Decoder[F, Option[A]] =
+      if f then fa.map(_.some) else Option.empty.pure
   }
 
   def eval[F[_], A](fa: F[A]): Decoder[F, A] =
@@ -137,16 +140,22 @@ object Decoder {
 
   enum Endianness(
       val uint16: (Byte, Byte) => Short,
-      val uint32: (Byte, Byte, Byte, Byte) => Int) {
+      val uint32: (Byte, Byte, Byte, Byte) => Int,
+      val uint64: (Int, Int) => Long
+  ) {
     case Little
         extends Endianness(
           (b0, b1) => ((b0 & 0xff) + ((b1 & 0xff) << 8)).toShort,
           (b0, b1, b2, b3) =>
-            (b0 & 0xff) + ((b1 & 0xff) << 8) + ((b2 & 0xff) << 16) + ((b3 & 0xff) << 24))
+            (b0 & 0xff) + ((b1 & 0xff) << 8) + ((b2 & 0xff) << 16) + ((b3 & 0xff) << 24),
+          (i0, i1) => (i0 & 0xffff_ffff).toLong + ((i1 & 0xffff_ffff).toLong << 32)
+        )
     case Big
         extends Endianness(
           (b0, b1) => Little.uint16(b1, b0),
-          (b0, b1, b2, b3) => Little.uint32(b3, b2, b1, b0))
+          (b0, b1, b2, b3) => Little.uint32(b3, b2, b1, b0),
+          (i0, i1) => Little.uint64(i1, i0)
+        )
   }
 
   def uint16[F[_]](using end: Endianness): Decoder[F, Short] =
@@ -163,12 +172,51 @@ object Decoder {
       b3 <- uint8
     yield end.uint32(b0, b1, b2, b3)
 
+  def uint64[F[_]](using end: Endianness): Decoder[F, Long] =
+    for
+      int0 <- uint32
+      int1 <- uint32
+    yield end.uint64(int0, int1)
+
+  enum IntSize[Out] {
+    case _4 extends IntSize[(Int, Int)]
+    case _8 extends IntSize[Byte]
+    case _16 extends IntSize[Short]
+    case _32 extends IntSize[Int]
+    case _64 extends IntSize[Long]
+  }
+
+  object IntSize {
+    def fromSize(size: Int): Option[IntSize[?]] =
+      size match {
+        case 4 => Some(_4)
+        case 8 => Some(_8)
+        case 16 => Some(_16)
+        case 32 => Some(_32)
+        case 64 => Some(_64)
+        case _ => None
+      }
+    // def decode4[F[_]]: Decoder[F, (IntSize[?], Byte)] = uin
+    // def decode8[F[_]]: Decoder[F, IntSize[?]] = uint8.
+  }
+
+  def uint[F[_], Out](size: IntSize[Out])(using Endianness): Decoder[F, Out] =
+    size match {
+      case IntSize._4 => uint4x2[F]
+      case IntSize._8 => uint8[F]
+      case IntSize._16 => uint16[F]
+      case IntSize._32 => uint32[F]
+      case IntSize._64 => uint64[F]
+    }
+
   def cstr[F[_]]: Decoder[F, String] = {
     def go(s: StringBuilder): Decoder[F, StringBuilder] =
       uint8.flatMap(b => if b != 0 then go(s.addOne(b.toChar)) else s.pure)
 
     go(new StringBuilder).map(_.toString)
   }
+
+  def uint4x2[F[_]]: Decoder[F, (Int, Int)] = uint8.map(b => (b & 0xf0, b & 0x0f))
 
   def drop8[F[_]](n: Int): Decoder[F, Unit] = if n == 0 then void else uint8 >> drop8(n - 1)
 
@@ -184,4 +232,7 @@ object Decoder {
 
   def fail[F[_], A](e: Error): Decoder[F, A] = e.raiseError
   def fail[F[_], A](msg: String): Decoder[F, A] = fail(Unknown(msg))
+
+  def pure[F[_]]: [A] => A => Decoder[F, A] = [A] =>
+    (a: A) => summon[Applicative[Decoder[F, _]]].pure[A](a)
 }
