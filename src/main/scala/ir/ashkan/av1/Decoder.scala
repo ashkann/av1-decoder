@@ -16,6 +16,8 @@ import cats.data.{OptionT, EitherT}
 import cats.effect.{Sync, IO, Concurrent}
 import cats.effect.std.Console
 import fs2.{Stream, Pull}
+import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 
 case class Decoder[F[_], A](run: Stream[F, Byte] => Pull[F, Nothing, Decoder.Result[F, A]]) {
   def decode(bs: Stream[F, Byte])(using Concurrent[F]): F[Decoder.Result[F, A]] =
@@ -85,8 +87,11 @@ object Decoder {
   }
 
   extension [F[_], A](fa: Decoder[F, A]) {
-    def assert(p: A => Boolean, msg: String = ""): Decoder[F, A] =
-      fa.ensureOr(AssertionFailed(_, msg))(p)
+    def assert(p: A => Boolean, msg: => String = ""): Decoder[F, A] =
+      assert(p, _ => msg)
+
+    def assert(p: A => Boolean, msg: A => String): Decoder[F, A] =
+      fa.ensureOr(a => AssertionFailed(a, msg(a)))(p)
 
     def const(c: A, msg: String = ""): Decoder[F, A] = fa.assert(_ == c, s"$msg (c = $c)")
 
@@ -99,6 +104,17 @@ object Decoder {
           case Success(a, rest, c) => Success((a, c), rest, c)
           case Failure(e, c) => Failure(e, c)
         })
+
+    def consumeTo(size: Int): Decoder[F, A] = fa
+      .withConsumed
+      .flatMap((a, c) => (if c < size then drop8(size - c) else Decoder.void).as(a))
+
+    def withOffset: Decoder[F, (A, Int)] = withConsumed.map((a, c) => (a, c - 1))
+
+    def assertConsumed(expected: Int): Decoder[F, A] =
+      withConsumed
+        .assert(_._2 == expected, (_, c) => s"Consumed $c bytes instead of $expected bytes")
+        .map(_._1)
   }
 
   def eval[F[_], A](fa: F[A]): Decoder[F, A] =
@@ -117,19 +133,42 @@ object Decoder {
     case None => Failure(Error.EndOfStream, 0)
   })
 
-  def uint16[F[_]]: Decoder[F, Short] =
+  def char8[F[_]]: Decoder[F, Char] = uint8.map(_.toChar)
+
+  enum Endianness(
+      val uint16: (Byte, Byte) => Short,
+      val uint32: (Byte, Byte, Byte, Byte) => Int) {
+    case Little
+        extends Endianness(
+          (b0, b1) => ((b0 & 0xff) + ((b1 & 0xff) << 8)).toShort,
+          (b0, b1, b2, b3) =>
+            (b0 & 0xff) + ((b1 & 0xff) << 8) + ((b2 & 0xff) << 16) + ((b3 & 0xff) << 24))
+    case Big
+        extends Endianness(
+          (b0, b1) => Little.uint16(b1, b0),
+          (b0, b1, b2, b3) => Little.uint32(b3, b2, b1, b0))
+  }
+
+  def uint16[F[_]](using end: Endianness): Decoder[F, Short] =
     for
       b0 <- uint8
       b1 <- uint8
-    yield ((b0 & 0xff) + ((b1 & 0xff) << 8)).toShort
+    yield end.uint16(b0, b1)
 
-  def uint32[F[_]]: Decoder[F, Int] =
+  def uint32[F[_]](using end: Endianness): Decoder[F, Int] =
     for
       b0 <- uint8
       b1 <- uint8
       b2 <- uint8
       b3 <- uint8
-    yield (b0 & 0xff) + ((b1 & 0xff) << 8) + ((b2 & 0xff) << 16) + ((b3 & 0xff) << 24)
+    yield end.uint32(b0, b1, b2, b3)
+
+  def cstr[F[_]]: Decoder[F, String] = {
+    def go(s: StringBuilder): Decoder[F, StringBuilder] =
+      uint8.flatMap(b => if b != 0 then go(s.addOne(b.toChar)) else s.pure)
+
+    go(new StringBuilder).map(_.toString)
+  }
 
   def drop8[F[_]](n: Int): Decoder[F, Unit] = if n == 0 then void else uint8 >> drop8(n - 1)
 
@@ -144,4 +183,5 @@ object Decoder {
   def prefix[F[_]](s: String): Decoder[F, Unit] = prefix(s.toList.map(_.toByte))
 
   def fail[F[_], A](e: Error): Decoder[F, A] = e.raiseError
+  def fail[F[_], A](msg: String): Decoder[F, A] = fail(Unknown(msg))
 }

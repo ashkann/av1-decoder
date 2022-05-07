@@ -19,10 +19,12 @@ import cats.effect.kernel.Deferred
 import scala.collection.immutable.ArraySeq
 import scala.collection.mutable.Builder
 
-object ReadBmp extends IOApp.Simple {
+object ReadBmp extends IOApp.Simple {  
   import Decoder.*
   import Decoder.Error.*
   import Decoder.Result.*
+
+  given Endianness = Endianness.Little
 
   case class RGB(r: Byte, g: Byte, b: Byte) {
     val raw = Raw(r, g, b)
@@ -107,8 +109,8 @@ object ReadBmp extends IOApp.Simple {
       yield offset
 
     for {
-      (offset, s1) <- header.withConsumed 
-      ((w, h, bpp), s2) <- dib.withConsumed
+      (offset, s1) <- header.withOffset 
+      ((w, h, bpp), s2) <- dib.withOffset
       _ <- println(s"Header size: $s1, DIB size: $s2, Offset: $offset")
       _ <- println(s"${w}x${h} pixels, Color depth: $bpp")
       _ <- drop8(offset - s1 - s2)
