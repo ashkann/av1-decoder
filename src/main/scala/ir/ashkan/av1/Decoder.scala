@@ -18,6 +18,7 @@ import cats.effect.std.Console
 import fs2.{Stream, Pull}
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
+import ir.ashkan.av1.Decoder.Result
 
 case class Decoder[F[_], A](run: Stream[F, Byte] => Pull[F, Nothing, Decoder.Result[F, A]]) {
   def decode(bs: Stream[F, Byte])(using Concurrent[F]): F[Decoder.Result[F, A]] =
@@ -33,12 +34,18 @@ object Decoder {
 
   enum Result[+F[_], +A] {
     case Success(value: A, remainder: Stream[F, Byte], consumed: Int)
-    case Failure(error: Error, consumed: Int)
+    case Failure(error: Error, consumed: Int, tag: Option[String] = None)
 
-    def addConsumed(prev: Int): Result[F, A] =
+    def map[B](f: A => B): Result[F, B] = 
       this match {
-        case Success(a, rest, c) => Success(a, rest, c + prev)
-        case Failure(e, c) => Failure(e, c + prev)
+        case Success(a, rest, c) => Success(f(a), rest, c)
+        case Failure(e, c, t) => Failure(e, c, t)
+      }
+
+    def addConsumed(n: Int): Result[F, A] =
+      this match {
+        case f: Success[F, A] => f.copy(consumed = f.consumed + n)
+        case f: Failure[F, A] => f.copy(consumed = f.consumed + n)
       }
   }
 
@@ -49,14 +56,11 @@ object Decoder {
     override def flatMap[A, B](fa: Decoder[F, A])(f: A => Decoder[F, B]): Decoder[F, B] =
       Decoder(fa.run(_).flatMap {
         case Success(a, rest, c) => f(a).run(rest).map(_.addConsumed(c))
-        case Failure(e, c) => Pull.pure(Failure(e, c))
+        case Failure(e, c, t) => Pull.pure(Failure(e, c, t))
       })
 
     override def map[A, B](fa: Decoder[F, A])(f: A => B): Decoder[F, B] =
-      Decoder(fa.run(_).map {
-        case Success(a, rest, c) => Success(f(a), rest, c)
-        case Failure(e, c) => Failure(e, c)
-      })
+      Decoder(fa.run(_).map(_.map(f)))
 
     override def tailRecM[A, B](a: A)(f: A => Decoder[F, Either[A, B]]): Decoder[F, B] = {
       def g(
@@ -67,7 +71,7 @@ object Decoder {
         f(a).run(bs).map {
           case Success(Right(b), r, c2) => Right(Success(b, r, c + c2))
           case Success(Left(a), r, c2) => Left((a, r, c + c2))
-          case Failure(e, c2) => Right(Failure(e, c + c2))
+          case Failure(e, c2, t) => Right(Failure(e, c + c2, t))
         }
 
       Decoder[F, B]((a, _, 0).tailRecM(g))
@@ -75,15 +79,13 @@ object Decoder {
 
     override def pure[A](a: A): Decoder[F, A] = Decoder(Success(a, _, 0).pure)
 
-    override def handleErrorWith[A](fa: Decoder[F, A])(
-        f: Error => Decoder[F, A]): Decoder[F, A] =
-      Decoder(bs =>
-        fa.run(bs).flatMap {
-          case Failure(e, c) => f(e).run(bs).map(_.addConsumed(c))
+    override def handleErrorWith[A](fa: Decoder[F, A])(f: Error => Decoder[F, A]): Decoder[F, A] =
+      Decoder(bs => fa.run(bs).flatMap {
+          case Failure(e, c, _) => f(e).run(bs).map(_.addConsumed(c))
           case success => Pull.pure(success)
-        })
+      })
 
-    override def raiseError[A](e: Error): Decoder[F, A] = Decoder(_ => Pull.pure(Failure(e, 0)))
+    override def raiseError[A](e: Error): Decoder[F, A] = Decoder(_ => Pull.pure(Failure(e, 0, None)))
   }
 
   extension [F[_], A](fa: Decoder[F, A]) {
@@ -102,7 +104,7 @@ object Decoder {
       Decoder(bs =>
         fa.run(bs).map {
           case Success(a, rest, c) => Success((a, c), rest, c)
-          case Failure(e, c) => Failure(e, c)
+          case Failure(e, c, t) => Failure(e, c, t)
         })
 
     def consumeTo(size: Int): Decoder[F, A] = fa
@@ -118,6 +120,11 @@ object Decoder {
 
     def when(f: Boolean): Decoder[F, Option[A]] =
       if f then fa.map(_.some) else Option.empty.pure
+
+    def tag(tag: String): Decoder[F, A] = Decoder(fa.run.andThen(_.map {
+          case f: Failure[F, A] => f.copy(tag = Some(tag))
+          case s => s
+    }))
   }
 
   def eval[F[_], A](fa: F[A]): Decoder[F, A] =
@@ -133,7 +140,7 @@ object Decoder {
 
   def uint8[F[_]]: Decoder[F, Byte] = Decoder(_.pull.uncons1.map {
     case Some((a, remainder)) => Success(a, remainder, 1)
-    case None => Failure(Error.EndOfStream, 0)
+    case None => Failure(Error.EndOfStream, 0, None)
   })
 
   def char8[F[_]]: Decoder[F, Char] = uint8.map(_.toChar)
@@ -216,7 +223,7 @@ object Decoder {
     go(new StringBuilder).map(_.toString)
   }
 
-  def uint4x2[F[_]]: Decoder[F, (Int, Int)] = uint8.map(b => (b & 0xf0, b & 0x0f))
+  def uint4x2[F[_]]: Decoder[F, (Int, Int)] = uint8.map(b => (b & 0xff >> 4, b & 0x0f))
 
   def drop8[F[_]](n: Int): Decoder[F, Unit] = if n == 0 then void else uint8 >> drop8(n - 1)
 

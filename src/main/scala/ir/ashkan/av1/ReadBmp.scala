@@ -158,6 +158,6 @@ object ReadBmp extends IOApp.Simple {
             .compile
             .drain >> Console[IO].println(s"Read $c bytes. Done")
 
-        case Decoder.Result.Failure(e, c) => Console[IO].println(s"Read $c bytes. $e")
+        case Decoder.Result.Failure(e, c, _) => Console[IO].println(s"Read $c bytes. $e")
       } yield ()
 }

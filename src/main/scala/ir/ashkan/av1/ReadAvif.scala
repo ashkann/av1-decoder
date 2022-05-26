@@ -17,8 +17,9 @@ import cats.Traverse
 import cats.Monad
 import scala.collection.immutable.ArraySeq
 import scala.collection.mutable.Builder
+import scala.util.Try
 
-object Avf1 extends IOApp.Simple {
+object ReadAvif extends IOApp.Simple {
   import Decoder.*
   import Decoder.Error.*
   import Decoder.Result.*
@@ -44,11 +45,11 @@ object Avf1 extends IOApp.Simple {
   // "%s (%02X,%02X,%02X,%02X)".format(fcc.str, fcc._4, fcc._1, fcc._2, fcc._3, fcc._4))
   given Show[List[FourCC]] = Show.show(_.map(_.show).mkString(", "))
 
-  case class BoxHeader(size: Int, fourcc: FourCC, version: Int, flags: Int)
+  case class BoxHeader(size: Int, code: FourCC, version: Int, flags: Int)
 
   given Show[BoxHeader] =
     Show.show(b =>
-      show"${b.fourcc}, size ${b.size}, version ${b.version}, flags ${b.flags.toBinaryString}")
+      show"${b.code}, size ${b.size}, version ${b.version}, flags ${b.flags.toBinaryString}")
 
   def fileType[F[_]: Console]: Decoder[F, Unit] = for
     size <- uint32
@@ -80,61 +81,63 @@ object Avf1 extends IOApp.Simple {
     boxHeader
       .flatTap(println)
       .withConsumed
-      .flatMap((h, c) => payload(h).assertConsumed(h.size - c))
+      .flatMap((h, c) => payload(h).assertConsumed(h.size - c).tag(h.show))
 
   def ignore[F[_]: Console](header: BoxHeader): Decoder[F, Unit] = drop8(header.size - 12)
 
+  def isValidIntSize(size: Int): Boolean = 
+    Set(0, 4, 8).contains(size)
+
+  def sizedInt[F[_]](bytes: Int) = bytes match {
+    case 0 => Decoder.pure[F](0L)
+    case 4 => uint32.map(_.toLong)
+    case 8 => uint64.map(_.toLong)
+    case s => Decoder.fail(s"Unsupported integer size: $s")                
+  }
+
   def metaData[F[_]: Console](size: Int): Decoder[F, Unit] = {
-    def itemLocation[F[_]: Console](version: Int): Decoder[F, Unit] =
-      for
-        (offsetSize, lengthSize) <- uint4x2
-        (baseOffsetSize, snd) <- uint4x2
-        indexSize = Option.when(version == 1 || version == 2)(snd)
-        itemCount <- if version < 2 then uint16.map(_.toInt) else uint32
-        _ <- (
-          for
-            itemId <- if version < 2 then uint16.map(_.toInt) else uint32
-            _ <- uint16.when(version == 1 || version == 2)
+    case class ItemLocation(itemId: Int, dataReferenceIndex: Int, baseOffset: Long)
+
+    enum MetaDataBox[T](val code: FourCC, val payload: BoxHeader => Decoder[F, T]) {
+      case iloc extends MetaDataBox(('i','l','o','c'), h => 
+        (for
+          _ <- drop8(1)
+          (baseOffsetSize, _) <- uint4x2
+          itemCount <- uint16
+          item = for {
+            itemId <- uint16[F]
             dataReferenceIndex <- uint16
-            _ = IntSize.fromSize(baseOffsetSize)
-            baseOffset <- baseOffsetSize match {
-              case 0 => Decoder.pure[F](0L)
-              case 4 => uint32.map(_.toLong)
-              case 8 => uint64
-              case s => Decoder.fail(s"Unsupported base_offset_size: $s")
-            }
-            extentCount <- uint16
-            // _ <- (
-            //   for
-            //     _ <- ()
-            //   yield ???  
-            // )
-          yield ()
-        ).replicateA(itemCount)
-        _ <- println((offsetSize, lengthSize))
-      yield ()
+            baseOffset <- sizedInt(baseOffsetSize).tag("base_offset")
+            _ <- uint16.const(0, "extent_count")
+          } yield ItemLocation(itemId, dataReferenceIndex, baseOffset)
+          items <- item.replicateA(itemCount)
+          _ <- println(items)(using summon)(using Show.fromToString)
+        yield items
+      ).consumeTo(h.size - 12))
+      case pitm extends MetaDataBox(('p','i','t','m'), ignore)
+      case idat extends MetaDataBox(('i','d','a','t'), ignore)
+      case iprp extends MetaDataBox(('i','p','r','p'), ignore)
+      case iinf extends MetaDataBox(('i','i','n','f'), ignore)
+      case iref extends MetaDataBox(('i','r','e','f'), ignore)
+    }
 
-    val items = Map[String, BoxHeader => Decoder[F, Unit]](
-      "iloc" -> (h => itemLocation[F](h.version).consumeTo(h.size - 12)),
-      "pitm" -> ignore[F],
-      "idat" -> ignore[F],
-      "iprp" -> ignore[F],
-      "iinf" -> ignore[F],
-      "iref" -> ignore[F]
-    )
+    object MetaDataBox {
+      def apply(code: FourCC): Option[MetaDataBox[?]] = values.find(_.code == code)
+      val codes: Set[FourCC] = values.map(_.code).toSet
+    }
 
-    def go(codes: Map[String, BoxHeader => Decoder[F, Unit]])
-        : Decoder[F, Map[String, BoxHeader => Decoder[F, Unit]]] =
+    def go(codes: Set[FourCC]): Decoder[F, Set[FourCC]] =
       if codes.nonEmpty then
         box(h =>
-          codes
-            .getOrElse(h.fourcc.str, _ => Decoder.fail(show"Unexpected box type: $h"))(h)
-            .as(codes - h.fourcc.str)).flatMap(go)
-      else Map.empty.pure
+          MetaDataBox(h.code)
+          .map(_.payload(h).as(h.code))
+          .getOrElse(Decoder.fail(show"Unexpected box type: $h"))
+        ).flatMap(code => go(codes - code))
+      else Set.empty.pure
 
     for
       _ <- box(_ => handlerTypeDefinition)
-      _ <- go(items)
+      _ <- go(MetaDataBox.codes)
     yield ()
   }
 
@@ -179,6 +182,6 @@ object Avf1 extends IOApp.Simple {
             .compile
             .drain >> Console[IO].println(s"Read $c bytes. Done")
 
-        case Decoder.Result.Failure(e, c) => Console[IO].println(s"Read $c bytes. $e")
+        case Decoder.Result.Failure(e, c, t) => Console[IO].println(s"Read $c bytes. $e on tag=$t")
       } yield ()
 }
